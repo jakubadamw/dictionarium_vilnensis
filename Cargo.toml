@@ -1,0 +1,30 @@
+[package]
+name = "dictionarium_vilnensis"
+version = "0.1.0"
+authors = ["Jakub Adam Wieczorek <ja.wieczorek@student.uw.edu.pl>"]
+
+[dependencies]
+backoff = "*"
+clippy = { version = "*", optional = true }
+console = "*"
+env_logger = "*"
+futures = "*"
+hyper = "*"
+hyper-tls = "*"
+indicatif = "*"
+iron = "*"
+itertools = "*"
+log = "*"
+logger = "*"
+num = "*"
+postgres = "*"
+rand = "*"
+reduce = "*"
+regex = "*"
+router = "*"
+select = "*"
+threadpool = "*"
+time = "*"
+tokio-core = "*"
+url = "*"
+urlencoded = "*"
