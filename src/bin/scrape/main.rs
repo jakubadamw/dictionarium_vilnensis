@@ -90,7 +90,7 @@ fn get_ssid() -> Result<String, Error> {
 	})
 }
 
-fn get_page(ssid: &str, letter: char, offset: u8, word: Option<&str>) -> Result<select::document::Document, Error> {
+fn get_page(ssid: &str, letter: char, offset: u8, word: Option<u32>) -> Result<select::document::Document, Error> {
 	use url::form_urlencoded::Serializer;
 
 	CORE.with(|core| {
@@ -101,12 +101,12 @@ fn get_page(ssid: &str, letter: char, offset: u8, word: Option<&str>) -> Result<
 
 	    let mut data = Serializer::new(String::new());
 	    data.extend_pairs(&[
-	    	("idHasla", "0"),
+	    	("idHasla", word.unwrap_or(0).to_string().as_str()),
 	    	("uklad", "poziomy"),
-	    	("offset", &offset.to_string()),
-	    	("litera", &letter.to_string()),
+	    	("offset", offset.to_string().as_str()),
+	    	("litera", letter.to_string().as_str()),
 	    	("Wsposob", "0"),
-	    	("Whaslo", word.unwrap_or("")),
+	    	("Whaslo", ""),
 	    	("Wkolejnosc", "a fronte"),
 	    	("czesc", "str"),
 	    	("str", "3"),
@@ -145,8 +145,83 @@ const NUMBER_OF_THREADS: usize = 32;
 const LETTERS: &'static str = "ABCĆDEFGHIJKLŁMNOÓPQRSŚTUVWXYZŹŻ";
 
 fn main() {
+	use std::env;
+
+	match env::args().nth(1) {
+		Some(ref s) if s == "words" => scrape_words(),
+		Some(ref s) if s == "defs" => scrape_defs(),
+		_ => panic!("missing")
+  	}
+}
+
+fn scrape_defs() {
+	use std::io::{BufRead, BufReader};
+	use std::fs::File;
 	use backoff::Operation;
-	use select::predicate::{Attr, Child, Name, Predicate};
+	use select::predicate::{Attr, Child, Name};
+	use std::io::Write;
+	use itertools::Itertools;
+
+	let ssid = get_ssid().unwrap();
+
+	let word_count = BufReader::new(File::open("words").unwrap()).lines().count();
+	let pb = indicatif::ProgressBar::new(word_count as u64);
+	pb.set_style(indicatif::ProgressStyle::default_bar().template("{msg} {wide_bar} {pos}/{len}"));
+
+	let max_queue_size = NUMBER_OF_THREADS * 4;
+
+	let pool = ThreadPool::new(NUMBER_OF_THREADS);
+	let (tx, rx) = channel();
+
+	let mut f = File::create("output").unwrap();
+    let file = BufReader::new(File::open("words").unwrap());
+    for line in file
+    	.lines()
+    	.map(|line| line.unwrap().trim().to_string()) {
+    	let (id, word) = line.split('\t').tuples().next().unwrap();
+		let tx = tx.clone();
+		let ssid = ssid.clone();
+
+		let id: u32 = id.parse().unwrap();
+		let word = word.to_string();
+
+		pool.execute(move || {
+			let mut backoff = backoff::ExponentialBackoff::default();
+			let mut op = || -> Result<_, backoff::Error<Error>> {
+				get_page(&ssid, 'A', 0, Some(id))
+					.map_err(|e| e.to_backoff_error())
+			};
+			
+			let document: Result<select::document::Document, Error> = op.retry(&mut backoff).map_err(|e| e.into());
+			let def = document.unwrap().find(Attr("id", "haslo")).next().unwrap().inner_html();
+			tx.send((word.clone(), def)).expect("should have sent");
+		});
+
+		rx
+			.iter()
+			.take(if pool.queued_count() > max_queue_size { pool.queued_count() - max_queue_size } else { 0 })
+			.inspect(|&(ref word, _)| {
+				pb.inc(1);
+				pb.set_message(&word);
+			})
+			.for_each(|(word, def)| { writeln!(&mut f, "{}\t{}", word, def).unwrap(); });
+    }
+
+	rx
+		.into_iter()
+		.take(pool.queued_count())
+		.inspect(|&(ref word, _)| {
+			pb.inc(1);
+			pb.set_message(&word);
+		})
+		.for_each(|(word, def)| { writeln!(&mut f, "{}\t{}", word, def).unwrap(); });
+
+	pb.finish();
+}
+
+fn scrape_words() {
+	use backoff::Operation;
+	use select::predicate::{Attr, Child, Name};
 	use std::io::Write;
 
 	let ssid = get_ssid().unwrap();
@@ -211,27 +286,29 @@ fn main() {
 						.map_err(|e| e.to_backoff_error())
 				};
 				
+				let re = regex::Regex::new(r"javascript: haslo\((\d+)").unwrap();
 				let document = op.retry(&mut backoff).unwrap();
 				let words = document.find(Child(Attr("id", "listaHasel"), Name("div"))).into_selection();
 				for node in words.iter().take(words.len() - 1) {
 					let a = node.find(Name("a")).filter(|c| c.attr("id").is_none()).next().unwrap();
+					let id: u32 = re.captures(a.attr("href").unwrap()).unwrap().get(1).unwrap().as_str().parse().unwrap();
 					let word = a.text();
-					tx.send(word).expect("should have sent");
+					tx.send((id, word)).expect("should have sent");
 				}
 			});
 		}
 	}
 
-	let mut f = File::create("output").unwrap();
+	let mut f = File::create("words").unwrap();
 
 	rx
 		.into_iter()
 		.take(total_count as usize)
-		.inspect(|word| {
+		.inspect(|&(ref id, ref word)| {
 			pb.inc(1);
-			pb.set_message(word);
+			pb.set_message(&word);
 		})
-		.for_each(|word| { writeln!(&mut f, "{}", word).unwrap(); });
+		.for_each(|(id, word)| { writeln!(&mut f, "{}\t{}", id, word).unwrap(); });
 
 	pb.finish();
 }
