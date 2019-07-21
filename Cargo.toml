@@ -1,21 +1,26 @@
 [package]
 name = "dictionarium_vilnensis"
 version = "0.1.0"
-authors = ["Jakub Adam Wieczorek <ja.wieczorek@student.uw.edu.pl>"]
+
+authors = ["Jakub Adam Wieczorek <jakub.adam.wieczorek@gmail.com>"]
+
+edition = "2018"
 
 [dependencies]
 backoff = "*"
-clippy = { version = "*", optional = true }
 console = "*"
+cookie = { version = "*", features = ["percent-encode"] }
 env_logger = "*"
-futures = "*"
-hyper = "*"
-hyper-tls = "*"
+futures-preview = { version = "=0.3.0-alpha.17", features = ["async-await", "nightly"] }
+http = "*"
+hyper = { git = "https://github.com/hyperium/hyper.git" }
+hyper-tls = { git = "https://github.com/95th/hyper-tls.git" }
 indicatif = "*"
 iron = "*"
 itertools = "*"
 log = "*"
 logger = "*"
+mime = "*"
 num = "*"
 postgres = "*"
 rand = "*"
@@ -25,6 +30,9 @@ router = "*"
 select = "*"
 threadpool = "*"
 time = "*"
-tokio-core = "*"
+tokio = { git = "https://github.com/tokio-rs/tokio", branch = "master" }
 url = "*"
 urlencoded = "*"
+
+[dev-dependencies]
+clippy = "*"

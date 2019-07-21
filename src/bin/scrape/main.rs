@@ -1,314 +1,205 @@
-extern crate backoff;
-extern crate futures;
-extern crate hyper;
-extern crate hyper_tls;
-extern crate indicatif;
-extern crate itertools;
-extern crate num;
-extern crate regex;
-extern crate select;
-extern crate threadpool;
-extern crate tokio_core;
-extern crate url;
+#![feature(async_await)]
 
 use std::cell::RefCell;
-use std::fs::File;
 use std::sync::mpsc::channel;
 
-use futures::{Future, Stream};
-use hyper::{Client, Method, Request};
-use hyper_tls::HttpsConnector;
 use threadpool::ThreadPool;
-use tokio_core::reactor::Core;
-
-thread_local!(static CORE: RefCell<Core> = RefCell::new(Core::new().unwrap()));
-
-#[derive(Debug)]
-pub enum Error {
-	Hyper(hyper::Error),
-	Io(std::io::Error),
-	String(std::string::FromUtf8Error)
-}
-
-impl Error {
-	fn to_backoff_error(self) -> backoff::Error<Error> {
-		match self {
-			Error::Hyper(_) | Error::Io(_) =>
-				backoff::Error::Transient(self),
-			_ =>
-				backoff::Error::Permanent(self)
-		}
-	}
-}
-
-impl From<backoff::Error<Error>> for Error {
-	fn from(error: backoff::Error<Error>) -> Self {
-		match error {
-			backoff::Error::Transient(e) | backoff::Error::Permanent(e) => e
-		}
-	}
-}
-
-impl From<hyper::Error> for Error {
-	fn from(error: hyper::Error) -> Self {
-		Error::Hyper(error)
-	}
-}
-
-impl From<std::io::Error> for Error {
-	fn from(error: std::io::Error) -> Self {
-		Error::Io(error)
-	}
-}
-
-impl From<std::string::FromUtf8Error> for Error {
-	fn from(error: std::string::FromUtf8Error) -> Self {
-		Error::String(error)
-	}
-}
-
-fn get_ssid() -> Result<String, Error> {
-	CORE.with(|core| {
-		let mut core = core.borrow_mut();
-	    let client = Client::configure()
-	    	.connector(HttpsConnector::new(4, &core.handle()).unwrap())
-	    	.build(&core.handle());
-
-		let url = "https://eswil.ijp.pan.pl/index.php?str=otworz-slownik".parse().unwrap();
-		let re = regex::Regex::new(r"PHPSESSID=([a-z0-9]+);").unwrap();
-
-		let future = client
-			.get(url)
-			.map(|res| {
-				let header = res.headers().get::<hyper::header::SetCookie>().unwrap();
-				assert_eq!(header.len(), 1);
-				re.captures(&header[0]).unwrap().get(1).unwrap().as_str().to_string()
-			})
-			.from_err::<Error>();
-
-		core.run(future)
-	})
-}
-
-fn get_page(ssid: &str, letter: char, offset: u8, word: Option<u32>) -> Result<select::document::Document, Error> {
-	use url::form_urlencoded::Serializer;
-
-	CORE.with(|core| {
-		let mut core = core.borrow_mut();
-	    let client = Client::configure()
-	    	.connector(HttpsConnector::new(4, &core.handle()).unwrap())
-	    	.build(&core.handle());
-
-	    let mut data = Serializer::new(String::new());
-	    data.extend_pairs(&[
-	    	("idHasla", word.unwrap_or(0).to_string().as_str()),
-	    	("uklad", "poziomy"),
-	    	("offset", offset.to_string().as_str()),
-	    	("litera", letter.to_string().as_str()),
-	    	("Wsposob", "0"),
-	    	("Whaslo", ""),
-	    	("Wkolejnosc", "a fronte"),
-	    	("czesc", "str"),
-	    	("str", "3"),
-	    	("skala", "100"),
-	    	("nowyFiltr", ""),
-	    	("hSz", "0")
-	    ]);
-
-		let url = "https://eswil.ijp.pan.pl/index.php".parse().unwrap();
-		let mut request = Request::new(Method::Post, url);
-
-		{
-			let headers = request.headers_mut();
-			headers.set(hyper::header::ContentType::form_url_encoded());
-			headers.set(hyper::header::UserAgent::new("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/64.0.3247.0 Safari/537.36"));
-
-			let mut cookie = hyper::header::Cookie::new();
-			cookie.set("PHPSESSID", ssid.to_string());
-			headers.set(cookie);
-		}
-
-		request.set_body(data.finish());
-
-		let future = client
-			.request(request)
-			.and_then(|res| res.body().concat2())
-			.from_err::<Error>()
-			.and_then(|chunk| Ok(select::document::Document::from_read(chunk.as_ref())?))
-			.from_err::<Error>();
-
-		core.run(future)
-	})
-}
+use tokio::runtime::current_thread::Runtime;
 
 const NUMBER_OF_THREADS: usize = 32;
 const LETTERS: &'static str = "ABCĆDEFGHIJKLŁMNOÓPQRSŚTUVWXYZŹŻ";
 
 fn main() {
-	use std::env;
+    use std::env;
 
-	match env::args().nth(1) {
-		Some(ref s) if s == "words" => scrape_words(),
-		Some(ref s) if s == "defs" => scrape_defs(),
-		_ => panic!("missing")
-  	}
+    match env::args().nth(1) {
+        Some(ref s) if s == "words" => scrape_words(),
+        Some(ref s) if s == "defs" => scrape_defs(),
+        _ => panic!("missing")
+    }
+}
+
+fn get_ssid() -> String {
+    Runtime::new()
+        .unwrap()
+        .block_on(dictionarium_vilnensis::get_ssid())
+        .unwrap()
+}
+
+fn read_words_from<R>(input: R) -> impl Iterator<Item = (u32, String)>
+    where R: std::io::Read {
+    use itertools::Itertools;
+    use std::io::BufRead;
+
+    std::io::BufReader::new(input)
+        .lines()
+        .map(|line| line.unwrap().trim().to_string())
+        .map(|line| line.split('\t').map(String::from).tuples().next().unwrap())
+        .map(|(id, word)| (id.parse().unwrap(), word))
 }
 
 fn scrape_defs() {
-	use std::io::{BufRead, BufReader};
-	use std::fs::File;
-	use backoff::Operation;
-	use select::predicate::{Attr, Child, Name};
-	use std::io::Write;
-	use itertools::Itertools;
+    use backoff::Operation;
+    use itertools::Itertools;
+    use select::predicate::Attr;
 
-	let ssid = get_ssid().unwrap();
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+    use std::io::Write;
 
-	let word_count = BufReader::new(File::open("words").unwrap()).lines().count();
-	let pb = indicatif::ProgressBar::new(word_count as u64);
-	pb.set_style(indicatif::ProgressStyle::default_bar().template("{msg} {wide_bar} {pos}/{len}"));
+    let ssid = get_ssid();
+    let word_count = BufReader::new(File::open("words").unwrap()).lines().count();
+    let pb = indicatif::ProgressBar::new(word_count as u64);
+    pb.set_style(indicatif::ProgressStyle::default_bar().template("{msg} {wide_bar} {pos}/{len}"));
 
-	let max_queue_size = NUMBER_OF_THREADS * 4;
+    let pool = ThreadPool::new(NUMBER_OF_THREADS);
+    let (tx, rx) = channel();
 
-	let pool = ThreadPool::new(NUMBER_OF_THREADS);
-	let (tx, rx) = channel();
+    let mut output_file = File::create("output").unwrap();
+    let word_file = File::open("words").unwrap();
+    read_words_from(word_file)
+        .map(|(id, word)| {
+            let tx = tx.clone();
+            let ssid = ssid.clone();
+            pool.execute(move || {
+                let mut backoff = backoff::ExponentialBackoff::default();
+                let mut op = || {
+                    let future = dictionarium_vilnensis::get_page(&ssid, 'A', 0, Some(id));
+                    Runtime::new().unwrap().block_on(future)
+                        .map_err(|e| e.to_backoff_error())
+                };
+                
+                let document: select::document::Document = op
+                    .retry(&mut backoff)
+                    .expect("should have succeeded");
 
-	let mut f = File::create("output").unwrap();
-    let file = BufReader::new(File::open("words").unwrap());
-    for line in file
-    	.lines()
-    	.map(|line| line.unwrap().trim().to_string()) {
-    	let (id, word) = line.split('\t').tuples().next().unwrap();
-		let tx = tx.clone();
-		let ssid = ssid.clone();
+                let def = document.find(Attr("id", "haslo")).next().unwrap().inner_html();
+                tx.send((word, def)).expect("should have sent");
+            });
+        })
+        .chunks(NUMBER_OF_THREADS * 4)
+        .into_iter()
+        .flat_map(|chunk| rx.iter().take(chunk.count()))
+        .inspect(|&(ref word, _)| {
+            pb.inc(1);
+            pb.set_message(word);
+        })
+        .for_each(|(word, def)| {
+            writeln!(output_file, "{}\t{}", word, def).unwrap();
+        });
 
-		let id: u32 = id.parse().unwrap();
-		let word = word.to_string();
+    pb.finish();
+}
 
-		pool.execute(move || {
-			let mut backoff = backoff::ExponentialBackoff::default();
-			let mut op = || -> Result<_, backoff::Error<Error>> {
-				get_page(&ssid, 'A', 0, Some(id))
-					.map_err(|e| e.to_backoff_error())
-			};
-			
-			let document: Result<select::document::Document, Error> = op.retry(&mut backoff).map_err(|e| e.into());
-			let def = document.unwrap().find(Attr("id", "haslo")).next().unwrap().inner_html();
-			tx.send((word.clone(), def)).expect("should have sent");
-		});
+fn scrape_counts() -> std::collections::HashMap<char, u32> {
+    use backoff::Operation;
+    use select::predicate::Attr;
 
-		rx
-			.iter()
-			.take(if pool.queued_count() > max_queue_size { pool.queued_count() - max_queue_size } else { 0 })
-			.inspect(|&(ref word, _)| {
-				pb.inc(1);
-				pb.set_message(&word);
-			})
-			.for_each(|(word, def)| { writeln!(&mut f, "{}\t{}", word, def).unwrap(); });
-    }
+    let ssid = get_ssid();
+    let message = RefCell::new(String::from(LETTERS));
+    let char_count = LETTERS.chars().count();
 
-	rx
-		.into_iter()
-		.take(pool.queued_count())
-		.inspect(|&(ref word, _)| {
-			pb.inc(1);
-			pb.set_message(&word);
-		})
-		.for_each(|(word, def)| { writeln!(&mut f, "{}\t{}", word, def).unwrap(); });
+    let pb = indicatif::ProgressBar::new(char_count as u64);
+    pb.set_message(&message.borrow());
+    pb.set_style(indicatif::ProgressStyle::default_bar()
+        .template("{msg} {wide_bar} {pos}/{len}"));
 
-	pb.finish();
+    let pool = ThreadPool::new(NUMBER_OF_THREADS);
+    let (tx, rx) = channel();
+    LETTERS
+        .chars()
+        .map(|letter| {
+            let tx = tx.clone();
+            let ssid = ssid.clone();
+            pool.execute(move || {
+                let mut backoff = backoff::ExponentialBackoff::default();
+                let mut op = || {
+                    let future = dictionarium_vilnensis::get_page(&ssid, letter, 0, None);
+                    Runtime::new().unwrap().block_on(future)
+                        .map_err(|e| e.to_backoff_error())
+                };
+                
+                let document: select::document::Document = op
+                    .retry(&mut backoff)
+                    .expect("should have succeeded");
+                    
+                let re = regex::Regex::new(r"(\d+)-(\d+)/(\d+)").unwrap();
+                let left = document.find(Attr("id", "listaHasel")).next().unwrap().children().nth(0).unwrap().text();
+                let captures = re.captures(left.trim()).unwrap();
+                let out_of: u32 = captures.get(3).unwrap().as_str().parse().unwrap();
+
+                tx.send((letter, out_of)).expect("should have sent");
+            });
+        })
+        .take(LETTERS.len())
+        .map(|_| rx.recv().unwrap())
+        .inspect(|(letter, _)| {
+            pb.inc(1);
+            let new_message = message.borrow_mut().replace(*letter, "-");
+            *message.borrow_mut() = new_message;
+            pb.set_message(&message.borrow());
+        })
+        .collect()
 }
 
 fn scrape_words() {
-	use backoff::Operation;
-	use select::predicate::{Attr, Child, Name};
-	use std::io::Write;
+    use backoff::Operation;
+    use select::predicate::{Attr, Child, Name};
 
-	let ssid = get_ssid().unwrap();
+    use std::fs::File;
+    use std::io::Write;
 
-	let message = RefCell::new(String::from(LETTERS));
-	let char_count = LETTERS.chars().count();
+    const PAGE_SIZE: u32 = 200;
 
-	let pb = indicatif::ProgressBar::new(char_count as u64);
-	pb.set_message(&message.borrow());
-	pb.set_style(indicatif::ProgressStyle::default_bar().template("{msg} {wide_bar} {pos}/{len}"));
+    let ssid = get_ssid();
+    let counts = scrape_counts();
+    let total_count: u32 = counts.values().sum();
 
-	let pool = ThreadPool::new(NUMBER_OF_THREADS);
-	let (tx, rx) = channel();
+    let pb = indicatif::ProgressBar::new(total_count as u64);
+    pb.set_style(indicatif::ProgressStyle::default_bar().template("{eta} {wide_bar} {pos}/{len}"));
 
-	for letter in LETTERS.chars() {
-		let tx = tx.clone();
-		let ssid = ssid.clone();
-		pool.execute(move || {
-			let mut backoff = backoff::ExponentialBackoff::default();
-			let mut op = || -> Result<_, backoff::Error<Error>> {
-				get_page(&ssid, letter, 0, None)
-					.map_err(|e| e.to_backoff_error())
-			};
-			
-			let document: Result<select::document::Document, Error> = op.retry(&mut backoff).map_err(|e| e.into());
-			let re = regex::Regex::new(r"(\d+)-(\d+)/(\d+)").unwrap();
-			let left = document.unwrap().find(Attr("id", "listaHasel")).next().unwrap().children().nth(0).unwrap().text();
-			let captures = re.captures(left.trim()).unwrap();
-			let out_of: u32 = captures.get(3).unwrap().as_str().parse().unwrap();
+    let mut output_file = File::create("words").unwrap();
+    let pool = ThreadPool::new(NUMBER_OF_THREADS);
+    let (tx, rx) = channel();
+    for (letter, count) in counts {
+        for i in num::range_step(0, count, PAGE_SIZE) {
+            let tx = tx.clone();
+            let ssid = ssid.clone();
+            let offset = i / PAGE_SIZE;
+            pool.execute(move || {
+                let mut backoff = backoff::ExponentialBackoff::default();
+                let mut op = || {
+                    let future = dictionarium_vilnensis::get_page(&ssid, letter, offset as u8, None);
+                    Runtime::new().unwrap().block_on(future)
+                        .map_err(|e| e.to_backoff_error())
+                };
+                
+                let re = regex::Regex::new(r"javascript: haslo\((\d+)").unwrap();
+                let document: select::document::Document = op
+                    .retry(&mut backoff)
+                    .expect("should have succeeded");
 
-			tx.send((letter, out_of)).expect("should have sent");
-		});
-	}
+                let words = document.find(Child(Attr("id", "listaHasel"), Name("div"))).into_selection();
+                for node in words.iter().take(words.len() - 1) {
+                    let a = node.find(Name("a")).filter(|c| c.attr("id").is_none()).next().unwrap();
+                    let id: u32 = re.captures(a.attr("href").unwrap()).unwrap().get(1).unwrap().as_str().parse().unwrap();
+                    let word = a.text();
+                    tx.send((id, word)).expect("should have sent");
+                }
+            });
+        }
+    }	
 
-	let counts: std::collections::HashMap<char, u32> = rx
-		.into_iter()
-		.take(char_count)
-		.inspect(|&(letter, _)| {
-			pb.inc(1);
-			let new_message = message.borrow_mut().replace(letter, "-");
-			*message.borrow_mut() = new_message;
-			pb.set_message(&message.borrow());
-		})
-		.collect();
-	let total_count: u32 = counts.values().sum();
+    rx
+        .into_iter()
+        .take(total_count as usize)
+        .inspect(|&(_, ref word)| {
+            pb.inc(1);
+            pb.set_message(&word);
+        })
+        .for_each(|(id, word)| {
+            writeln!(&mut output_file, "{}\t{}", id, word).unwrap();
+        });
 
-	pb.finish();
-
-	let pb = indicatif::ProgressBar::new(total_count as u64);
-	pb.set_style(indicatif::ProgressStyle::default_bar().template("{eta} {wide_bar} {pos}/{len}"));
-
-	let (tx, rx) = channel();
-	for (letter, count) in counts {
-		for i in num::range_step(0, count, 200) {
-			let tx = tx.clone();
-			let ssid = ssid.clone();
-			let offset = i / 200;
-			pool.execute(move || {
-				let mut backoff = backoff::ExponentialBackoff::default();
-				let mut op = || -> Result<_, backoff::Error<Error>> {
-					get_page(&ssid, letter, offset as u8, None)
-						.map_err(|e| e.to_backoff_error())
-				};
-				
-				let re = regex::Regex::new(r"javascript: haslo\((\d+)").unwrap();
-				let document = op.retry(&mut backoff).unwrap();
-				let words = document.find(Child(Attr("id", "listaHasel"), Name("div"))).into_selection();
-				for node in words.iter().take(words.len() - 1) {
-					let a = node.find(Name("a")).filter(|c| c.attr("id").is_none()).next().unwrap();
-					let id: u32 = re.captures(a.attr("href").unwrap()).unwrap().get(1).unwrap().as_str().parse().unwrap();
-					let word = a.text();
-					tx.send((id, word)).expect("should have sent");
-				}
-			});
-		}
-	}
-
-	let mut f = File::create("words").unwrap();
-
-	rx
-		.into_iter()
-		.take(total_count as usize)
-		.inspect(|&(ref id, ref word)| {
-			pb.inc(1);
-			pb.set_message(&word);
-		})
-		.for_each(|(id, word)| { writeln!(&mut f, "{}\t{}", id, word).unwrap(); });
-
-	pb.finish();
+    pb.finish();
 }
