@@ -12,7 +12,7 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn to_backoff_error(self) -> backoff::Error<Error> {
+    pub fn into_backoff_error(self) -> backoff::Error<Error> {
         match self {
             Error::Http(_) | Error::Hyper(_) | Error::Io(_) =>
                 backoff::Error::Transient(self),

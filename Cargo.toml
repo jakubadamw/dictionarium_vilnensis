@@ -30,7 +30,7 @@ router = "*"
 select = "*"
 threadpool = "*"
 time = "*"
-tokio = { git = "https://github.com/tokio-rs/tokio", branch = "master" }
+tokio = { git = "https://github.com/tokio-rs/tokio" }
 url = "*"
 urlencoded = "*"
 

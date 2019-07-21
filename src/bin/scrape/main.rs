@@ -7,7 +7,7 @@ use threadpool::ThreadPool;
 use tokio::runtime::current_thread::Runtime;
 
 const NUMBER_OF_THREADS: usize = 32;
-const LETTERS: &'static str = "ABCĆDEFGHIJKLŁMNOÓPQRSŚTUVWXYZŹŻ";
+const LETTERS: &str = "ABCĆDEFGHIJKLŁMNOÓPQRSŚTUVWXYZŹŻ";
 
 fn main() {
     use std::env;
@@ -66,7 +66,7 @@ fn scrape_defs() {
                 let mut op = || {
                     let future = dictionarium_vilnensis::get_page(&ssid, 'A', 0, Some(id));
                     Runtime::new().unwrap().block_on(future)
-                        .map_err(|e| e.to_backoff_error())
+                        .map_err(|e| e.into_backoff_error())
                 };
                 
                 let document: select::document::Document = op
@@ -91,7 +91,7 @@ fn scrape_defs() {
     pb.finish();
 }
 
-fn scrape_counts() -> std::collections::HashMap<char, u32> {
+fn scrape_counts() -> std::collections::HashMap<char, u64> {
     use backoff::Operation;
     use select::predicate::Attr;
 
@@ -116,7 +116,7 @@ fn scrape_counts() -> std::collections::HashMap<char, u32> {
                 let mut op = || {
                     let future = dictionarium_vilnensis::get_page(&ssid, letter, 0, None);
                     Runtime::new().unwrap().block_on(future)
-                        .map_err(|e| e.to_backoff_error())
+                        .map_err(|e| e.into_backoff_error())
                 };
                 
                 let document: select::document::Document = op
@@ -126,7 +126,7 @@ fn scrape_counts() -> std::collections::HashMap<char, u32> {
                 let re = regex::Regex::new(r"(\d+)-(\d+)/(\d+)").unwrap();
                 let left = document.find(Attr("id", "listaHasel")).next().unwrap().children().nth(0).unwrap().text();
                 let captures = re.captures(left.trim()).unwrap();
-                let out_of: u32 = captures.get(3).unwrap().as_str().parse().unwrap();
+                let out_of: u64 = captures.get(3).unwrap().as_str().parse().unwrap();
 
                 tx.send((letter, out_of)).expect("should have sent");
             });
@@ -149,13 +149,13 @@ fn scrape_words() {
     use std::fs::File;
     use std::io::Write;
 
-    const PAGE_SIZE: u32 = 200;
+    const PAGE_SIZE: u64 = 200;
 
     let ssid = get_ssid();
     let counts = scrape_counts();
-    let total_count: u32 = counts.values().sum();
+    let total_count = counts.values().sum();
 
-    let pb = indicatif::ProgressBar::new(total_count as u64);
+    let pb = indicatif::ProgressBar::new(total_count);
     pb.set_style(indicatif::ProgressStyle::default_bar().template("{eta} {wide_bar} {pos}/{len}"));
 
     let mut output_file = File::create("words").unwrap();
@@ -171,7 +171,7 @@ fn scrape_words() {
                 let mut op = || {
                     let future = dictionarium_vilnensis::get_page(&ssid, letter, offset as u8, None);
                     Runtime::new().unwrap().block_on(future)
-                        .map_err(|e| e.to_backoff_error())
+                        .map_err(|e| e.into_backoff_error())
                 };
                 
                 let re = regex::Regex::new(r"javascript: haslo\((\d+)").unwrap();
@@ -181,7 +181,7 @@ fn scrape_words() {
 
                 let words = document.find(Child(Attr("id", "listaHasel"), Name("div"))).into_selection();
                 for node in words.iter().take(words.len() - 1) {
-                    let a = node.find(Name("a")).filter(|c| c.attr("id").is_none()).next().unwrap();
+                    let a = node.find(Name("a")).find(|c| c.attr("id").is_none()).unwrap();
                     let id: u32 = re.captures(a.attr("href").unwrap()).unwrap().get(1).unwrap().as_str().parse().unwrap();
                     let word = a.text();
                     tx.send((id, word)).expect("should have sent");
