@@ -1,29 +1,25 @@
-#![feature(async_await)]
+#![feature(async_await, async_closure, type_ascription)]
 
 use std::cell::RefCell;
-use std::sync::mpsc::channel;
 
-use threadpool::ThreadPool;
+use dictionarium_vilnensis as dv;
+
 use tokio::runtime::current_thread::Runtime;
-
-const NUMBER_OF_THREADS: usize = 32;
-const LETTERS: &str = "ABCĆDEFGHIJKLŁMNOÓPQRSŚTUVWXYZŹŻ";
 
 fn main() {
     use std::env;
 
+    better_panic::install();
+
     match env::args().nth(1) {
-        Some(ref s) if s == "words" => scrape_words(),
-        Some(ref s) if s == "defs" => scrape_defs(),
+        Some(ref s) if s == "words" => {
+            Runtime::new().unwrap().block_on(scrape_words());
+        }
+        Some(ref s) if s == "defs" => {
+            Runtime::new().unwrap().block_on(scrape_defs());
+        }
         _ => panic!("missing")
     }
-}
-
-fn get_ssid() -> String {
-    Runtime::new()
-        .unwrap()
-        .block_on(dictionarium_vilnensis::get_ssid())
-        .unwrap()
 }
 
 fn read_words_from<R>(input: R) -> impl Iterator<Item = (u32, String)>
@@ -38,64 +34,50 @@ fn read_words_from<R>(input: R) -> impl Iterator<Item = (u32, String)>
         .map(|(id, word)| (id.parse().unwrap(), word))
 }
 
-fn scrape_defs() {
-    use backoff::Operation;
-    use itertools::Itertools;
-    use select::predicate::Attr;
-
+async fn scrape_defs() {
+    use futures::future::FutureExt;
+    use futures::stream::StreamExt;
+    
     use std::fs::File;
     use std::io::{BufRead, BufReader};
     use std::io::Write;
 
-    let ssid = get_ssid();
+    const BUFFER_SIZE: usize = 64;
+
+    let ssid = dv::get_ssid().await.expect("should have gotten the SSID");
+
     let word_count = BufReader::new(File::open("words").unwrap()).lines().count();
+
     let pb = indicatif::ProgressBar::new(word_count as u64);
     pb.set_style(indicatif::ProgressStyle::default_bar().template("{msg} {wide_bar} {pos}/{len}"));
 
-    let pool = ThreadPool::new(NUMBER_OF_THREADS);
-    let (tx, rx) = channel();
-
-    let mut output_file = File::create("output").unwrap();
+    let mut output_file = File::create("defs").unwrap();
     let word_file = File::open("words").unwrap();
-    read_words_from(word_file)
+    let fut = futures::stream::iter(read_words_from(word_file)
         .map(|(id, word)| {
-            let tx = tx.clone();
             let ssid = ssid.clone();
-            pool.execute(move || {
-                let mut backoff = backoff::ExponentialBackoff::default();
-                let mut op = || {
-                    let future = dictionarium_vilnensis::get_page(&ssid, 'A', 0, Some(id));
-                    Runtime::new().unwrap().block_on(future)
-                        .map_err(|e| e.into_backoff_error())
-                };
-                
-                let document: select::document::Document = op
-                    .retry(&mut backoff)
-                    .expect("should have succeeded");
-
-                let def = document.find(Attr("id", "haslo")).next().unwrap().inner_html();
-                tx.send((word, def)).expect("should have sent");
-            });
-        })
-        .chunks(NUMBER_OF_THREADS * 4)
-        .into_iter()
-        .flat_map(|chunk| rx.iter().take(chunk.count()))
-        .inspect(|&(ref word, _)| {
+            dv::get_def_with_backoff(ssid, id).map(move |def| (id, word, def))
+        }))
+        .buffered(BUFFER_SIZE)
+        .inspect(|&(_, ref word, _)| {
             pb.inc(1);
             pb.set_message(word);
         })
-        .for_each(|(word, def)| {
-            writeln!(output_file, "{}\t{}", word, def).unwrap();
+        .for_each(|(id, word, def)| {
+            writeln!(output_file, "{}\t{}\t{}", id, word, def).unwrap();
+            futures::future::ready(())
         });
+
+    fut.await;
 
     pb.finish();
 }
 
-fn scrape_counts() -> std::collections::HashMap<char, u64> {
-    use backoff::Operation;
-    use select::predicate::Attr;
+async fn scrape_counts(ssid: String) -> std::collections::HashMap<char, u64> {
+    use futures::stream::StreamExt;
 
-    let ssid = get_ssid();
+    const LETTERS: &str = "ABCĆDEFGHIJKLŁMNOÓPQRSŚTUVWXYZŹŻ";
+
     let message = RefCell::new(String::from(LETTERS));
     let char_count = LETTERS.chars().count();
 
@@ -104,102 +86,69 @@ fn scrape_counts() -> std::collections::HashMap<char, u64> {
     pb.set_style(indicatif::ProgressStyle::default_bar()
         .template("{msg} {wide_bar} {pos}/{len}"));
 
-    let pool = ThreadPool::new(NUMBER_OF_THREADS);
-    let (tx, rx) = channel();
     LETTERS
         .chars()
         .map(|letter| {
-            let tx = tx.clone();
             let ssid = ssid.clone();
-            pool.execute(move || {
-                let mut backoff = backoff::ExponentialBackoff::default();
-                let mut op = || {
-                    let future = dictionarium_vilnensis::get_page(&ssid, letter, 0, None);
-                    Runtime::new().unwrap().block_on(future)
-                        .map_err(|e| e.into_backoff_error())
-                };
-                
-                let document: select::document::Document = op
-                    .retry(&mut backoff)
-                    .expect("should have succeeded");
-                    
-                let re = regex::Regex::new(r"(\d+)-(\d+)/(\d+)").unwrap();
-                let left = document.find(Attr("id", "listaHasel")).next().unwrap().children().nth(0).unwrap().text();
-                let captures = re.captures(left.trim()).unwrap();
-                let out_of: u64 = captures.get(3).unwrap().as_str().parse().unwrap();
-
-                tx.send((letter, out_of)).expect("should have sent");
-            });
+            dv::scrape_letter_count_with_backoff(ssid, letter)
         })
-        .take(LETTERS.len())
-        .map(|_| rx.recv().unwrap())
+        .collect::<futures::stream::FuturesUnordered<_>>()
         .inspect(|(letter, _)| {
             pb.inc(1);
             let new_message = message.borrow_mut().replace(*letter, "-");
             *message.borrow_mut() = new_message;
             pb.set_message(&message.borrow());
         })
-        .collect()
+        .collect::<std::collections::HashMap<_, _>>()
+        .await
 }
 
-fn scrape_words() {
-    use backoff::Operation;
-    use select::predicate::{Attr, Child, Name};
+async fn get_words(ssid: String, counts: std::collections::HashMap<char, u64>)
+    -> impl futures::Stream<Item = (u32, String)> {
+    use futures::stream::StreamExt;
+
+    const BUFFER_SIZE: usize = 16;
+    const PAGE_SIZE: u64 = 200;
+
+    futures::stream::iter(counts.into_iter()
+        .flat_map(move |(letter, count)| {
+            let ssid = ssid.clone();
+            num::range_step(0, count, PAGE_SIZE).map(move |i| {
+                let ssid = ssid.clone();
+                dv::get_words_from_page_with_backoff(ssid, letter, (i / PAGE_SIZE) as u16)
+            })
+        }))
+        .buffered(BUFFER_SIZE)
+        .map(Vec::into_iter)
+        .map(futures::stream::iter)
+        .flatten()
+}
+
+async fn scrape_words() {
+    use futures::future::FutureExt;
+    use futures::stream::StreamExt;
 
     use std::fs::File;
     use std::io::Write;
-
-    const PAGE_SIZE: u64 = 200;
-
-    let ssid = get_ssid();
-    let counts = scrape_counts();
+    
+    let ssid = dv::get_ssid().await.expect("should have gotten the SSID");
+    let counts = scrape_counts(ssid.clone()).await;
     let total_count = counts.values().sum();
 
     let pb = indicatif::ProgressBar::new(total_count);
     pb.set_style(indicatif::ProgressStyle::default_bar().template("{eta} {wide_bar} {pos}/{len}"));
 
     let mut output_file = File::create("words").unwrap();
-    let pool = ThreadPool::new(NUMBER_OF_THREADS);
-    let (tx, rx) = channel();
-    for (letter, count) in counts {
-        for i in num::range_step(0, count, PAGE_SIZE) {
-            let tx = tx.clone();
-            let ssid = ssid.clone();
-            let offset = i / PAGE_SIZE;
-            pool.execute(move || {
-                let mut backoff = backoff::ExponentialBackoff::default();
-                let mut op = || {
-                    let future = dictionarium_vilnensis::get_page(&ssid, letter, offset as u8, None);
-                    Runtime::new().unwrap().block_on(future)
-                        .map_err(|e| e.into_backoff_error())
-                };
-                
-                let re = regex::Regex::new(r"javascript: haslo\((\d+)").unwrap();
-                let document: select::document::Document = op
-                    .retry(&mut backoff)
-                    .expect("should have succeeded");
-
-                let words = document.find(Child(Attr("id", "listaHasel"), Name("div"))).into_selection();
-                for node in words.iter().take(words.len() - 1) {
-                    let a = node.find(Name("a")).find(|c| c.attr("id").is_none()).unwrap();
-                    let id: u32 = re.captures(a.attr("href").unwrap()).unwrap().get(1).unwrap().as_str().parse().unwrap();
-                    let word = a.text();
-                    tx.send((id, word)).expect("should have sent");
-                }
-            });
-        }
-    }	
-
-    rx
-        .into_iter()
-        .take(total_count as usize)
-        .inspect(|&(_, ref word)| {
+    let fut = get_words(ssid, counts)
+        .flatten_stream()
+        .for_each(|(id, ref word)| {
             pb.inc(1);
             pb.set_message(&word);
-        })
-        .for_each(|(id, word)| {
             writeln!(&mut output_file, "{}\t{}", id, word).unwrap();
+            futures::future::ready(())
         });
+
+    fut.await;
 
     pb.finish();
 }

@@ -96,7 +96,7 @@ pub async fn get_ssid() -> Result<String, Error> {
         .ok_or(Error::Cookie(CookieHeaderError::MissingCookie))
 }
 
-pub async fn get_page(ssid: &str, letter: char, offset: u8, word: Option<u32>) -> Result<select::document::Document, Error> {
+pub async fn get_page<S: AsRef<str>>(ssid: S, letter: char, offset: u16, word: Option<u32>) -> Result<select::document::Document, Error> {
     use futures::future::TryFutureExt;
     use futures::stream::TryStreamExt;
     use url::form_urlencoded::Serializer;
@@ -134,7 +134,7 @@ pub async fn get_page(ssid: &str, letter: char, offset: u8, word: Option<u32>) -
         .header(hyper::header::USER_AGENT,
             USER_AGENT)
         .header(hyper::header::COOKIE,
-            cookie::Cookie::new("PHPSESSID", ssid.to_string()).to_string())
+            cookie::Cookie::new("PHPSESSID", ssid.as_ref().to_owned()).to_string())
         .body(data.finish().into())?;
 
     let body = client
@@ -143,4 +143,83 @@ pub async fn get_page(ssid: &str, letter: char, offset: u8, word: Option<u32>) -
         .await?;
 
     Ok(select::document::Document::from_read(body.as_ref())?)
+}
+
+pub async fn scrape_letter_count_with_backoff(ssid: String, letter: char) -> (char, u64) {
+    use backoff_futures::TryFutureExt as _;
+    use futures::future::TryFutureExt;
+    use select::predicate::Attr;
+
+    let mut backoff = backoff::ExponentialBackoff::default();
+    let document = (|| get_page(&ssid, letter, 0, None).map_err(Error::into_backoff_error))
+        .with_backoff(&mut backoff)
+        .await
+        .expect("should have succeeded");
+
+    let re = regex::Regex::new(r"(\d+)-(\d+)/(\d+)").unwrap();
+    let left = document
+        .find(Attr("id", "listaHasel"))
+        .next()
+        .unwrap()
+        .children()
+        .nth(0)
+        .unwrap()
+        .text();
+
+    let captures = re.captures(left.trim()).unwrap();
+    (letter, captures.get(3).unwrap().as_str().parse().unwrap())
+}
+
+pub async fn get_def_with_backoff(ssid: String, id: u32) -> String {
+    use backoff_futures::TryFutureExt as _;
+    use futures::future::TryFutureExt;
+    use select::predicate::Attr;
+
+    let mut backoff = backoff::ExponentialBackoff::default();
+    let document =
+        (|| get_page(&ssid, 'A', 0, Some(id)).map_err(Error::into_backoff_error))
+            .with_backoff(&mut backoff)
+            .await
+            .expect("should have succeeded");
+
+    document.find(Attr("id", "haslo")).next().unwrap().inner_html()
+}
+
+pub async fn get_words_from_page_with_backoff(ssid: String, letter: char, offset: u16) -> Vec<(u32, String)> {
+    use backoff_futures::TryFutureExt as _;
+    use futures::future::TryFutureExt;
+    use select::predicate::{Attr, Child, Name};
+
+    let re = regex::Regex::new(r"javascript: haslo\((\d+)").unwrap();
+
+    let mut backoff = backoff::ExponentialBackoff::default();
+    let document =
+        (|| get_page(&ssid, letter, offset, None).map_err(Error::into_backoff_error))
+            .with_backoff(&mut backoff)
+            .await
+            .expect("should have succeeded");
+
+    let selection = document
+        .find(Child(Attr("id", "listaHasel"), Name("div")))
+        .into_selection();
+
+    selection
+        .iter()
+        .take(selection.len() - 1)
+        .map(|node| {
+            let a = node
+                .find(Name("a"))
+                .find(|c| c.attr("id").is_none())
+                .unwrap();
+            let id: u32 = re
+                .captures(a.attr("href").unwrap())
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .as_str()
+                .parse()
+                .unwrap();
+            (id, a.text())
+        })
+        .collect()
 }
