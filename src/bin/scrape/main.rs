@@ -30,8 +30,14 @@ fn read_words_from<R>(input: R) -> impl Iterator<Item = (u32, String)>
     std::io::BufReader::new(input)
         .lines()
         .map(|line| line.unwrap().trim().to_string())
-        .map(|line| line.split('\t').map(String::from).tuples().next().unwrap())
+        .enumerate()
+        .map(|(i, line)| line.split('\t').map(String::from).tuples().next().unwrap_or_else(|| panic!("{}: {}", i, line)))
         .map(|(id, word)| (id.parse().unwrap(), word))
+}
+
+enum DefResult {
+    AlreadyProcessed(String),
+    Result((u32, String, Result<String, dv::Error>))
 }
 
 async fn scrape_defs() {
@@ -43,29 +49,58 @@ async fn scrape_defs() {
     use std::io::Write;
 
     const BUFFER_SIZE: usize = 64;
+    const SYNC_EVERY: usize = 10;
 
     let ssid = dv::get_ssid().await.expect("should have gotten the SSID");
 
     let word_count = BufReader::new(File::open("words").unwrap()).lines().count();
 
-    let pb = indicatif::ProgressBar::new(word_count as u64);
-    pb.set_style(indicatif::ProgressStyle::default_bar().template("{msg} {wide_bar} {pos}/{len}"));
+    let words_already_scraped: std::collections::HashSet<u32> =
+        read_words_from(File::open("defs").unwrap())
+            .map(|el| el.0)
+            .collect();
 
-    let mut output_file = File::create("defs").unwrap();
+    let pb = indicatif::ProgressBar::new(word_count as u64);
+    pb.set_style(indicatif::ProgressStyle::default_bar()
+        .template("{msg} {eta} {wide_bar} {pos}/{len}"));
+
+    let mut output_file = std::fs::OpenOptions::new().append(true).open("defs").unwrap();
     let word_file = File::open("words").unwrap();
     let fut = futures::stream::iter(read_words_from(word_file)
         .map(|(id, word)| {
             let ssid = ssid.clone();
-            dv::get_def_with_backoff(ssid, id).map(move |def| (id, word, def))
+            let already_processed = words_already_scraped.contains(&id);
+            async move {
+                if already_processed {
+                    DefResult::AlreadyProcessed(word)
+                } else {
+                    let ssid = ssid.clone();
+                    let result = dv::get_def_with_backoff(ssid, id)
+                        .map(move |def| (id, word, def))
+                        .await;
+                    DefResult::Result(result)
+                }
+            }
         }))
         .buffered(BUFFER_SIZE)
-        .inspect(|&(_, ref word, _)| {
+        .inspect(|result| {
             pb.inc(1);
-            pb.set_message(word);
+            match result {
+                DefResult::Result((_, ref word, _))
+                    | DefResult::AlreadyProcessed(ref word) => {
+                    pb.set_message(word);
+                }
+            }
         })
-        .for_each(|(id, word, def)| {
-            writeln!(output_file, "{}\t{}\t{}", id, word, def).unwrap();
-            futures::future::ready(())
+        .fold(0, |count, result| {
+            if let DefResult::Result((id, word, def)) = result {
+                let def_string = def.unwrap_or_else(|_| "FAILED".to_string());
+                writeln!(output_file, "{}\t{}\t{}", id, word, def_string).unwrap();
+                if count % SYNC_EVERY == 0 {
+                    output_file.sync_all().unwrap();
+                }
+            }
+            futures::future::ready(count + 1)
         });
 
     fut.await;

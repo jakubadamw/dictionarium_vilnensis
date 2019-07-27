@@ -8,7 +8,8 @@ pub enum Error {
     Hyper(hyper::Error),
     Io(std::io::Error),
     Cookie(CookieHeaderError),
-    String(std::string::FromUtf8Error)
+    String(std::string::FromUtf8Error),
+    MissingElement(&'static str)
 }
 
 impl Error {
@@ -170,7 +171,7 @@ pub async fn scrape_letter_count_with_backoff(ssid: String, letter: char) -> (ch
     (letter, captures.get(3).unwrap().as_str().parse().unwrap())
 }
 
-pub async fn get_def_with_backoff(ssid: String, id: u32) -> String {
+pub async fn get_def_with_backoff(ssid: String, id: u32) -> Result<String, Error> {
     use backoff_futures::TryFutureExt as _;
     use futures::future::TryFutureExt;
     use select::predicate::Attr;
@@ -182,7 +183,11 @@ pub async fn get_def_with_backoff(ssid: String, id: u32) -> String {
             .await
             .expect("should have succeeded");
 
-    document.find(Attr("id", "haslo")).next().unwrap().inner_html()
+    document
+        .find(Attr("id", "haslo"))
+        .next()
+        .ok_or(Error::MissingElement("id"))
+        .map(|elem| elem.inner_html().trim().replace('\n', " "))
 }
 
 pub async fn get_words_from_page_with_backoff(ssid: String, letter: char, offset: u16) -> Vec<(u32, String)> {
