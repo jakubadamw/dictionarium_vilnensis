@@ -1,11 +1,7 @@
-#![feature(async_await)]
-
-use hyper::{Client, Request, Uri};
-
 #[derive(Debug)]
 pub enum Error {
     Http(http::Error),
-    Hyper(hyper::Error),
+    Isahc(isahc::Error),
     Io(std::io::Error),
     Cookie(CookieHeaderError),
     String(std::string::FromUtf8Error),
@@ -15,7 +11,7 @@ pub enum Error {
 impl Error {
     pub fn into_backoff_error(self) -> backoff::Error<Error> {
         match self {
-            Error::Http(_) | Error::Hyper(_) | Error::Io(_) =>
+            Error::Http(_) | Error::Isahc(_) | Error::Io(_) =>
                 backoff::Error::Transient(self),
             _ =>
                 backoff::Error::Permanent(self)
@@ -37,9 +33,9 @@ impl From<http::Error> for Error {
     }
 }
 
-impl From<hyper::Error> for Error {
-    fn from(error: hyper::Error) -> Self {
-        Self::Hyper(error)
+impl From<isahc::Error> for Error {
+    fn from(error: isahc::Error) -> Self {
+        Self::Isahc(error)
     }
 }
 
@@ -58,7 +54,7 @@ impl From<std::string::FromUtf8Error> for Error {
 #[derive(Debug)]
 pub enum CookieHeaderError {
     InvalidCookie(cookie::ParseError),
-    InvalidString(hyper::header::ToStrError),
+    InvalidString(http::header::ToStrError),
     MissingCookie
 }
 
@@ -68,22 +64,19 @@ impl From<cookie::ParseError> for CookieHeaderError {
     }
 }
 
-impl From<hyper::header::ToStrError> for CookieHeaderError {
-    fn from(error: hyper::header::ToStrError) -> Self {
+impl From<http::header::ToStrError> for CookieHeaderError {
+    fn from(error: http::header::ToStrError) -> Self {
         Self::InvalidString(error)
     }
 }
 
 pub async fn get_ssid() -> Result<String, Error> {
-    let https = hyper_tls::HttpsConnector::new(4).unwrap();
-    let client = Client::builder().build::<_, hyper::Body>(https);
+    const URL: &str = "https://eswil.ijp.pan.pl/index.php?str=otworz-slownik";
 
-    let url = "https://eswil.ijp.pan.pl/index.php?str=otworz-slownik".parse().unwrap();
-
-    let response = client.get(url).await?;
+    let response = isahc::get_async(URL).await?;
     let (valid, _) = response
         .headers()
-        .get_all(hyper::header::SET_COOKIE)
+        .get_all(http::header::SET_COOKIE)
         .iter()
         .map(|value| Ok(cookie::Cookie::parse_encoded(value.to_str()?)?))
         .partition::<Vec<Result<_, CookieHeaderError>>, _>(Result::is_ok);
@@ -98,8 +91,7 @@ pub async fn get_ssid() -> Result<String, Error> {
 }
 
 pub async fn get_page<S: AsRef<str>>(ssid: S, letter: char, offset: u16, word: Option<u32>) -> Result<select::document::Document, Error> {
-    use futures::future::TryFutureExt;
-    use futures::stream::TryStreamExt;
+    use isahc::RequestExt;
     use url::form_urlencoded::Serializer;
 
     const USER_AGENT: &str =
@@ -107,9 +99,6 @@ pub async fn get_page<S: AsRef<str>>(ssid: S, letter: char, offset: u16, word: O
          AppleWebKit/537.36 (KHTML, like Gecko) \
          Chrome/64.0.3247.0 Safari/537.36";
     const URL: &str = "https://eswil.ijp.pan.pl/index.php";
-
-    let https = hyper_tls::HttpsConnector::new(4).unwrap();
-    let client = Client::builder().build::<_, hyper::Body>(https);
 
     let mut data = Serializer::new(String::new());
     data.extend_pairs(&[
@@ -126,28 +115,23 @@ pub async fn get_page<S: AsRef<str>>(ssid: S, letter: char, offset: u16, word: O
         ("nowyFiltr", ""),
         ("hSz", "0")
     ]);
+    let data_string: String = data.finish().into();
 
-    let uri: Uri = URL.parse().expect("the hard-coded URL must be valid!");
-
-    let request = Request::post(uri)
-        .header(hyper::header::CONTENT_TYPE,
+    let request = http::Request::post(URL)
+        .header(http::header::CONTENT_TYPE,
             mime::APPLICATION_WWW_FORM_URLENCODED.as_ref())
-        .header(hyper::header::USER_AGENT,
+        .header(http::header::USER_AGENT,
             USER_AGENT)
-        .header(hyper::header::COOKIE,
+        .header(http::header::COOKIE,
             cookie::Cookie::new("PHPSESSID", ssid.as_ref().to_owned()).to_string())
-        .body(data.finish().into())?;
+        .body(data_string)?;
 
-    let body = client
-        .request(request)
-        .and_then(|res| res.into_body().try_concat())
-        .await?;
-
-    Ok(select::document::Document::from_read(body.as_ref())?)
+    let body = request.send_async().await?.into_body();
+    Ok(select::document::Document::from_read(body)?)
 }
 
 pub async fn scrape_letter_count_with_backoff(ssid: String, letter: char) -> (char, u64) {
-    use backoff_futures::TryFutureExt as _;
+    use backoff_futures::BackoffExt as _;
     use futures::future::TryFutureExt;
     use select::predicate::Attr;
 
@@ -172,7 +156,7 @@ pub async fn scrape_letter_count_with_backoff(ssid: String, letter: char) -> (ch
 }
 
 pub async fn get_def_with_backoff(ssid: String, id: u32) -> Result<String, Error> {
-    use backoff_futures::TryFutureExt as _;
+    use backoff_futures::BackoffExt as _;
     use futures::future::TryFutureExt;
     use select::predicate::Attr;
 
@@ -191,7 +175,7 @@ pub async fn get_def_with_backoff(ssid: String, id: u32) -> Result<String, Error
 }
 
 pub async fn get_words_from_page_with_backoff(ssid: String, letter: char, offset: u16) -> Vec<(u32, String)> {
-    use backoff_futures::TryFutureExt as _;
+    use backoff_futures::BackoffExt as _;
     use futures::future::TryFutureExt;
     use select::predicate::{Attr, Child, Name};
 

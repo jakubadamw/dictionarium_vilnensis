@@ -7,33 +7,25 @@ authors = ["Jakub Adam Wieczorek <jakub.adam.wieczorek@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-backoff = "*"
-backoff-futures = { git = "https://github.com/jakubadamw/backoff-futures.git" }
-better-panic = "*"
-console = "*"
+backoff = "0.1"
+backoff-futures = "0.1"
+better-panic = "0.1"
 cookie = { version = "*", features = ["percent-encode"] }
-env_logger = "*"
-futures-preview = { version = "=0.3.0-alpha.17", features = ["async-await", "nightly"] }
-http = "*"
-hyper = { git = "https://github.com/hyperium/hyper.git" }
-hyper-tls = { git = "https://github.com/hyperium/hyper-tls.git" }
-indicatif = "*"
-iron = "*"
-itertools = "*"
-log = "*"
-logger = "*"
-mime = "*"
-num = "*"
-postgres = "*"
-rand = "*"
-reduce = "*"
-regex = "*"
-router = "*"
-select = "*"
-time = "*"
-tokio = { git = "https://github.com/tokio-rs/tokio" }
-url = "*"
-urlencoded = "*"
+env_logger = "0.6"
+futures-preview = "=0.3.0-alpha.18"
+http = "0.1"
+indicatif = "0.11"
+isahc = "0.7"
+itertools = "0.8"
+mime = "0.3"
+num = "0.2"
+rand = "0.7"
+regex = "1.2"
+select = "0.4"
+time = "0.1"
+tokio = "0.2.0-alpha.1"
+url = "2.1"
+urlencoded = "0.6"
 
 [dev-dependencies]
 clippy = "*"

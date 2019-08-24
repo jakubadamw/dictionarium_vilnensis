@@ -1,25 +1,26 @@
-#![feature(async_await, async_closure, type_ascription)]
+#![feature(async_closure)]
 
 use std::cell::RefCell;
 
 use dictionarium_vilnensis as dv;
 
-use tokio::runtime::current_thread::Runtime;
-
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), ()> {
     use std::env;
 
     better_panic::install();
 
     match env::args().nth(1) {
         Some(ref s) if s == "words" => {
-            Runtime::new().unwrap().block_on(scrape_words());
+            scrape_words().await;
         }
         Some(ref s) if s == "defs" => {
-            Runtime::new().unwrap().block_on(scrape_defs());
+            scrape_defs().await;
         }
         _ => panic!("missing")
     }
+
+    Ok(())
 }
 
 fn read_words_from<R>(input: R) -> impl Iterator<Item = (u32, String)>
